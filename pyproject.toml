@@ -1,0 +1,15 @@
+# pyproject.toml
+[project]
+name = "comfyui-spectralvaedetailer" # Unique identifier for your node. Immutable after creation.
+description = "Adjusts a latent image before the VAE decoding step in order to improve your image quality."
+version = "0.0.1" # Custom node version. Must be semantically versioned.
+license = { file = "LICENSE.txt" }
+dependencies  = [] # Filled in from requirements.txt
+
+[project.urls]
+Repository = "https://github.com/SparknightLLC/ComfyUI-SpectralVAEDetailer"
+
+[tool.comfy]
+PublisherId = "sparknight" # TODO (fill in Publisher ID from Comfy Registry Website).
+DisplayName = "ComfyUI-SpectralVAEDetailer" # Display name for the Custom Node. Can be changed later.
+Icon = "https://example.com/icon.png" # SVG, PNG, JPG or GIF (MAX. 800x400px)
