@@ -22,6 +22,8 @@ It was specifically designed to boost photorealism in SDXL. Demo images generate
 
 ---
 
+---
+
 ## How it works (high level)
 
 SpectralVAEDetailer performs **one extra UNet evaluation** at a chosen `sigma`, then:
