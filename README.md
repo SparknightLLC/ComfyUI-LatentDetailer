@@ -79,10 +79,14 @@ Latent micrograin injection:
 ## Tips
 
 - If your image looks too flat:
-  - reduce `hf_radius` or `mid_strength`, or lower `sigma`.
+  - reduce `hf_radius`.
 
-- If you see grain in skies / flat backgrounds:
-  - raise `noise_scale`.
+- If your image looks too "splotchy"/noisy:
+  - reduce `sigmas` (try 0.2 or 0.3)
+  - or just upscale your image to smooth things out
+
+- If you want to control brightness:
+  - increase `mid_strength` for brighter, lower it for darker
 
 - If your images look blurry:
   - reduce `radius` and `chroma` parameters.
