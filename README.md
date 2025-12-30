@@ -66,6 +66,6 @@ Examples:
 
 ## Notes
 
-This node is intentionally speed-oriented: by default, it adds **only one** extra UNet passes plus lightweight tensor ops.
+This node is intentionally speed-oriented: by default, it adds **only one** extra UNet pass plus lightweight tensor ops.
 
 It’s primarily tuned for SDXL photoreal workflows, but can be experimented with on other latent diffusion models.
