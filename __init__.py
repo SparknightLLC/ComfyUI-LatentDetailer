@@ -5,6 +5,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -89,6 +91,7 @@ _HIRES_IMP_ENERGY_BLUR = 2
 
 # Center prior for "foreground-ish"
 _HIRES_CENTER_SIGMA = 0.55  # smaller => more center-biased
+_GRID_CACHE_MAX = 32  # max unique (H,W,device,dtype) grids cached
 
 # Cached center prior maps
 _CENTER_PRIOR_CACHE: dict[tuple[int, int, str, str], torch.Tensor] = {}
@@ -152,10 +155,13 @@ def _patcher_ctx(model_patcher):
 
 def _move_tensors(obj: Any, device: torch.device, dtype: torch.dtype | None):
 	if torch.is_tensor(obj):
-		t = obj.to(device=device)
-		if dtype is not None and torch.is_floating_point(t) and t.dtype != dtype:
-			t = t.to(dtype=dtype)
-		return t
+		# Prefer a single .to(device,dtype) dispatch when possible to avoid extra allocations.
+		dt = dtype if (dtype is not None and torch.is_floating_point(obj)) else None
+		if obj.device == device and (dt is None or obj.dtype == dt):
+			return obj
+		if dt is None:
+			return obj.to(device=device)
+		return obj.to(device=device, dtype=dt)
 	if isinstance(obj, dict):
 		return {k: _move_tensors(v, device, dtype) for k, v in obj.items()}
 	if isinstance(obj, list):
@@ -242,6 +248,150 @@ def _randn_like(x: torch.Tensor, seed: int) -> torch.Tensor:
 		return torch.randn_like(x)
 
 
+def _shape_noise_tail(n: torch.Tensor, noise_tail: float) -> torch.Tensor:
+	"""Reshape noise distribution tails while keeping RMS comparable.
+
+	noise_tail in [-1..1]:
+	- 0: Gaussian
+	- +: heavier tails (more occasional extremes)
+	- -: lighter tails (smoother, fewer extremes)
+	
+	Implementation notes:
+	- We apply a signed power transform to adjust tail-heaviness.
+	- We then renormalize per-channel RMS so `noise_scale` remains meaningful.
+	"""
+	t = float(max(-1.0, min(1.0, noise_tail)))
+	if abs(t) < 1e-6:
+		return n
+
+	# Map tail -> exponent. +1 => p=2.0 (heavier tails), -1 => p=0.5 (lighter tails)
+	p = 2.0**(t)
+
+	x = torch.sign(n) * torch.pow(torch.abs(n) + 1e-12, p)
+	return _rms_norm_(x)
+
+
+def _parse_sigmas_string(sigmas_str: str) -> list[float]:
+	"""Parse a comma-delimited string of normalized sigma positions in [0..1]."""
+	if sigmas_str is None:
+		return [0.40]
+	s = str(sigmas_str).strip()
+	if not s:
+		return [0.40]
+	parts = [p.strip() for p in s.split(",")]
+	vals: list[float] = []
+	for p in parts:
+		if not p:
+			continue
+		try:
+			v = float(p)
+		except Exception:
+			continue
+		if math.isnan(v) or math.isinf(v):
+			continue
+		vals.append(float(max(0.0, min(1.0, v))))
+	if not vals:
+		return [0.40]
+	return vals
+
+
+def _sigma_from_ratio(base_model, r01: float) -> float:
+	"""Map normalized [0..1] -> actual sigma value using the model's schedule when possible."""
+	r = float(max(0.0, min(1.0, r01)))
+	ms = getattr(base_model, "model_sampling", None)
+	sigmas = getattr(ms, "sigmas", None) if ms is not None else None
+	try:
+		if sigmas is not None:
+			n = int(sigmas.numel())
+			if n > 0:
+				idx = int(round(r * (n - 1)))
+				idx = max(0, min(n - 1, idx))
+				v = float(sigmas[idx].item())
+				return float(max(1e-6, v))
+	except Exception:
+		pass
+
+	sigma_max = None
+	sigma_min = None
+	if ms is not None:
+		sigma_max = getattr(ms, "sigma_max", None)
+		sigma_min = getattr(ms, "sigma_min", None)
+	try:
+		if sigma_max is not None:
+			smax = float(sigma_max)
+			smin = float(sigma_min) if sigma_min is not None else 1e-3
+			smin = float(max(1e-6, smin))
+			smax = float(max(smin, smax))
+			ls = math.log(smax)
+			le = math.log(smin)
+			return float(math.exp(ls + (le - ls) * r))
+	except Exception:
+		pass
+
+	smax = 1.0
+	smin = 1e-3
+	ls = math.log(smax)
+	le = math.log(smin)
+	return float(math.exp(ls + (le - ls) * r))
+
+
+def _apply_bloom_luma(out: torch.Tensor, strength: float, radius: int, threshold01: float) -> None:
+	"""Approximate bloom/halation by spreading bright highlights in luma (channel 0 only). In-place."""
+	s = float(max(0.0, min(1.0, strength)))
+	r = int(max(0, radius))
+	t = float(max(0.0, min(1.0, threshold01)))
+	if s <= 0.0 or r <= 0 or out.shape[1] < 1:
+		return
+
+	lum = out[:, :1]
+	mean = lum.mean(dim=(2, 3), keepdim=True)
+	std = lum.std(dim=(2, 3), keepdim=True) + 1e-6
+	z = (lum - mean) / std
+
+	ln = torch.sigmoid(z)  # 0..1
+	hi = torch.relu(ln - t)
+
+	hi_blur = _lowpass_avgpool(hi, r)
+	hi_blur = (hi_blur - hi_blur.mean(dim=(2, 3), keepdim=True)) * std
+
+	out[:, :1].add_(hi_blur, alpha=s * 0.35)
+
+
+def _grain_luma_weight(den_pos: torch.Tensor, grain_luma: float, noise_radius: int) -> torch.Tensor:
+	"""Return a per-pixel multiplicative weight for grain (B,1,H,W).
+
+	This biases grain toward darker regions and reduces it in highlights.
+	It primarily affects the grain injected by `noise_scale`.
+	"""
+	gl = float(max(0.0, min(1.0, grain_luma)))
+	if gl <= 0.0 or den_pos.ndim != 4:
+		# Safe fallback
+		b = int(den_pos.shape[0]) if hasattr(den_pos, "shape") else 1
+		h = int(den_pos.shape[-2]) if hasattr(den_pos, "shape") else 64
+		w = int(den_pos.shape[-1]) if hasattr(den_pos, "shape") else 64
+		return den_pos.new_ones((b, 1, h, w))
+
+	c = int(min(4, den_pos.shape[1]))
+	lum = den_pos[:, :c].mean(dim=1, keepdim=True)
+
+	# Blur to behave more like exposure-based grain rather than pixel-level chatter.
+	r = int(max(0, noise_radius))
+	blur_r = int(min(24, max(2, r * 4)))  # tie to grain correlation, but clamp for speed
+	if blur_r > 0:
+		lum = _lowpass_avgpool(lum, blur_r)
+
+	mean = lum.mean(dim=(2, 3), keepdim=True)
+	std = lum.std(dim=(2, 3), keepdim=True) + 1e-6
+	z = (lum - mean) / std
+
+	# Exponential curve: z < 0 (darker) => weight > 1 ; z > 0 => weight < 1
+	w_base = torch.exp(-1.75 * z)
+	w_base = torch.clamp(w_base, 0.25, 4.0)
+
+	w = (1.0 - gl) + gl * w_base
+	return w
+
+
 def _resolve_seed(seed: int) -> int:
 	if seed >= 0:
 		return int(seed)
@@ -305,11 +455,16 @@ def _rms_per_image(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 	return torch.sqrt(x.pow(2).mean(dim=(1, 2, 3), keepdim=True) + eps)
 
 
-def _upsample_latent(x: torch.Tensor, scale: int) -> torch.Tensor:
-	s = int(max(1, scale))
-	if s == 1:
+def _upsample_latent(x: torch.Tensor, scale: float) -> torch.Tensor:
+	s = float(scale)
+	if not (s > 1.0):
 		return x
-	return F.interpolate(x, scale_factor=float(s), mode="bilinear", align_corners=False)
+	h, w = int(x.shape[-2]), int(x.shape[-1])
+	th = max(1, int(round(h * s)))
+	tw = max(1, int(round(w * s)))
+	if th == h and tw == w:
+		return x
+	return F.interpolate(x, size=(th, tw), mode="bilinear", align_corners=False)
 
 
 def _downsample_latent_area(x: torch.Tensor, size_hw: tuple[int, int]) -> torch.Tensor:
@@ -372,6 +527,7 @@ def _color_drift_delta(
     radius: int,
     hf_radius: int,
     strength: float,
+    mask_cache: dict[int, torch.Tensor] | None = None,
 ) -> torch.Tensor:
 	s = float(max(0.0, min(1.0, strength)))
 	if s <= 0.0:
@@ -381,12 +537,11 @@ def _color_drift_delta(
 	if C < 2:
 		return ref.mul(0.0)
 
-	n = _randn_like(ref, int(seed) + int(_COLOR_DRIFT_SEED_OFFSET))
-	g = _bandpass_grain(n, int(max(0, radius)))
-
 	c1 = 1
 	c2 = min(4, C)
-	dr = g[:, c1:c2]
+	# Only generate noise for chroma channels we actually modify.
+	n = _randn_like(ref[:, c1:c2], int(seed) + int(_COLOR_DRIFT_SEED_OFFSET))
+	dr = _bandpass_grain(n, int(max(0, radius)))
 
 	dr = _soft_clip_tanh(dr, float(_COLOR_DRIFT_SOFTCLIP_K))
 
@@ -395,7 +550,12 @@ def _color_drift_delta(
 	dr = dr * torch.rsqrt(_rms_per_image(dr) + 1e-6)
 
 	mr = max(1, int(hf_radius))
-	m = _content_detail_mask_from_latent(x_in, mr)
+	if mask_cache is not None and mr in mask_cache:
+		m = mask_cache[mr]
+	else:
+		m = _content_detail_mask_from_latent(x_in, mr)
+		if mask_cache is not None:
+			mask_cache[mr] = m
 	m = m.clamp(0.0, 1.0).pow(float(_COLOR_DRIFT_MASK_GAMMA))
 	gate = float(_COLOR_DRIFT_BASE_ALLOW) + (1.0 - float(_COLOR_DRIFT_BASE_ALLOW)) * m
 
@@ -411,6 +571,7 @@ def _luma_clarity_delta(
     x_in: torch.Tensor,
     hf_radius: int,
     strength: float,
+    mask_cache: dict[int, torch.Tensor] | None = None,
 ) -> torch.Tensor:
 	s = float(max(0.0, min(1.0, strength)))
 	if s <= 0.0:
@@ -428,7 +589,12 @@ def _luma_clarity_delta(
 	band = band * torch.rsqrt(_rms_per_image(band) + 1e-6)
 
 	mr = max(1, int(hf_radius))
-	m = _content_detail_mask_from_latent(x_in, mr)
+	if mask_cache is not None and mr in mask_cache:
+		m = mask_cache[mr]
+	else:
+		m = _content_detail_mask_from_latent(x_in, mr)
+		if mask_cache is not None:
+			mask_cache[mr] = m
 	if _LUMA_CLARITY_FEATHER > 0:
 		m = _lowpass_avgpool_reflect(m, int(_LUMA_CLARITY_FEATHER))
 	m = m.clamp(0.0, 1.0).pow(float(_LUMA_CLARITY_MASK_GAMMA))
@@ -494,6 +660,7 @@ class SpectralVAEDetailer:
 	def __init__(self):
 		self._conv_cache = {}
 		self._enc_cache = {}
+		self._grid_cache = {}
 
 	@classmethod
 	def INPUT_TYPES(cls):
@@ -507,12 +674,10 @@ class SpectralVAEDetailer:
 		            "step": 1,
 		            "tooltip": "Random seed for grain/color drift. Use -1 for random each run."
 		        }),
-		        "sigma": ("FLOAT", {
-		            "default": 0.4,
-		            "min": 0.001,
-		            "max": 50.0,
-		            "step": 0.001,
-		            "tooltip": "Sigma at which to run the single UNet forward for detail projection."
+		        "sigmas": ("STRING", {
+		            "default": "0.40",
+		            "multiline": False,
+		            "tooltip": "Comma-delimited list of normalized sigma positions (0..1). Each entry runs one UNet evaluation and the denoised estimates are averaged. Example: 0.25,0.55. 0=start (noisiest), 1=end (cleanest)."
 		        }),
 
 		        # --- Main inputs
@@ -536,6 +701,28 @@ class SpectralVAEDetailer:
 		            "step": 0.01,
 		            "tooltip": "Boosts UNet-proposed micro detail ONLY where it appears confident; suppresses flats and strong edges."
 		        }),
+		        # --- Bloom (approx photographic halation / highlight spread)
+		        "bloom_strength": ("FLOAT", {
+		            "default": 0.0,
+		            "min": 0.0,
+		            "max": 1.0,
+		            "step": 0.01,
+		            "tooltip": "Approximate photographic bloom/halation by spreading bright highlights (luma only). Best paired with a little noise_scale (e.g. 0.02–0.08) for a more convincing photographic rolloff."
+		        }),
+		        "bloom_threshold": ("FLOAT", {
+		            "default": 0.65,
+		            "min": 0.0,
+		            "max": 1.0,
+		            "step": 0.01,
+		            "tooltip": "Only highlights above this luma threshold contribute to bloom."
+		        }),
+		        "bloom_radius": ("INT", {
+		            "default": 8,
+		            "min": 0,
+		            "max": 64,
+		            "step": 1,
+		            "tooltip": "Blur radius for bloom spread. Larger is softer but slower."
+		        }),
 
 		        # --- Color drift
 		        "color_drift": ("FLOAT", {
@@ -548,7 +735,7 @@ class SpectralVAEDetailer:
 		        "color_drift_radius": ("INT", {
 		            "default": 16,
 		            "min": 0,
-		            "max": 16,
+		            "max": 64,
 		            "step": 1,
 		            "tooltip": "Granular drift scale. 1..3 is typical; 16 is very broad/slow drift."
 		        }),
@@ -630,12 +817,19 @@ class SpectralVAEDetailer:
 		            "step": 0.01,
 		            "tooltip": "Adds some mid/low component of the base projection (contrast/shape)."
 		        }),
-		        "chroma_strength": ("FLOAT", {
+		        "detail_chroma": ("FLOAT", {
 		            "default": 0.1,
 		            "min": 0.0,
 		            "max": 2.0,
 		            "step": 0.01,
-		            "tooltip": "Scales latent channels 1..3 for detail/CFG injections."
+		            "tooltip": "Scales how much the detail + CFG injections affect chroma latent channels (1..3). This is NOT chromatic aberration (no spatial shift)."
+		        }),
+		        "chromatic_aberration": ("FLOAT", {
+		            "default": 0.0,
+		            "min": 0.0,
+		            "max": 1.0,
+		            "step": 0.01,
+		            "tooltip": "Lens-like chromatic aberration (spatial misregistration) applied to chroma latent channels (1..3) after all other adjustments. Very subtle effects are usually best (0.02–0.10)."
 		        }),
 		        "protect_lows": ("FLOAT", {
 		            "default": 0.9,
@@ -671,11 +865,25 @@ class SpectralVAEDetailer:
 
 		        # --- Grain
 		        "noise_scale": ("FLOAT", {
-		            "default": 0.2,
+		            "default": 0.1,
 		            "min": 0.0,
 		            "max": 0.5,
 		            "step": 0.01,
 		            "tooltip": "Micrograin intensity in latent space."
+		        }),
+		        "grain_luma": ("FLOAT", {
+		            "default": 0.0,
+		            "min": 0.0,
+		            "max": 1.0,
+		            "step": 0.01,
+		            "tooltip": "Luma-dependent grain: increases grain in shadows and reduces it in highlights. This primarily modulates the grain injected by noise_scale (and shaped by noise_radius)."
+		        }),
+		        "noise_tail": ("FLOAT", {
+		            "default": -1.0,
+		            "min": -1.0,
+		            "max": 1.0,
+		            "step": 0.01,
+		            "tooltip": "Tail-heaviness of the grain noise distribution. 0 = Gaussian. + = heavier tails (more occasional strong specks / grit). - = lighter tails (smoother). RMS-normalized so noise_scale stays comparable."
 		        }),
 		        "noise_radius": ("INT", {
 		            "default": 1,
@@ -693,11 +901,11 @@ class SpectralVAEDetailer:
 		        }),
 
 		        # --- Hires (bottom)
-		        "hires_scale": ("INT", {
-		            "default": 1,
-		            "min": 1,
-		            "max": 4,
-		            "step": 1,
+		        "hires_scale": ("FLOAT", {
+		            "default": 1.0,
+		            "min": 1.0,
+		            "max": 4.0,
+		            "step": 0.1,
 		            "tooltip": "If >1, runs ONE UNet pass at upscaled latent resolution, then downsamples denoised estimates back to 1x before post-processing."
 		        }),
 		        "hires_strength": ("FLOAT", {
@@ -724,7 +932,7 @@ class SpectralVAEDetailer:
 		            "default": True,
 		            "tooltip": "If ON, strips timestep limits from conditioning ranges (more consistent behavior)."
 		        }),
-		        "debug_print": ("BOOLEAN", {
+		        "debug": ("BOOLEAN", {
 		            "default": False,
 		            "tooltip": "Prints diagnostics to console."
 		        }),
@@ -779,11 +987,58 @@ class SpectralVAEDetailer:
 			raise RuntimeError("calc_cond_batch did not return [cond, uncond].")
 		return base_model, outs[0], outs[1]
 
+	def _base_grid(self, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+		key = (int(h), int(w), str(device), str(dtype))
+		g = self._grid_cache.get(key, None)
+		if g is not None:
+			# Refresh LRU position.
+			self._grid_cache.pop(key, None)
+			self._grid_cache[key] = g
+			return g
+		y = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=dtype)
+		x = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=dtype)
+		gy, gx = torch.meshgrid(y, x, indexing="ij")
+		grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)
+		self._grid_cache[key] = grid
+		if len(self._grid_cache) > int(_GRID_CACHE_MAX):
+			self._grid_cache.pop(next(iter(self._grid_cache)))
+		return grid
+
+	def _apply_chromatic_aberration(self, x: torch.Tensor, amount01: float) -> torch.Tensor:
+		"""Apply a subtle, lens-like chromatic aberration to latent channels 1..3."""
+		if x.shape[1] < 4:
+			return x
+		a = float(max(0.0, min(1.0, amount01)))
+		if a <= 0.0:
+			return x
+		b, c, h, w = x.shape
+		shift_px = a * 1.0
+		dx = float(2.0 * shift_px / max(1.0, (w - 1)))
+		dy = float(2.0 * shift_px / max(1.0, (h - 1)))
+		grid0 = self._base_grid(h, w, x.device, x.dtype)
+
+		g1 = grid0.clone()
+		g1[..., 0].add_(dx)
+		g2 = grid0.clone()
+		g2[..., 0].sub_(dx)
+		g3 = grid0.clone()
+		g3[..., 1].add_(dy)
+
+		c1 = F.grid_sample(x[:, 1:2], g1, mode="bilinear", padding_mode="border", align_corners=True)
+		c2 = F.grid_sample(x[:, 2:3], g2, mode="bilinear", padding_mode="border", align_corners=True)
+		c3 = F.grid_sample(x[:, 3:4], g3, mode="bilinear", padding_mode="border", align_corners=True)
+
+		out = x.clone()
+		out[:, 1:2] = c1
+		out[:, 2:3] = c2
+		out[:, 3:4] = c3
+		return out
+
 	@torch.no_grad()
 	def apply(
 	    self,
 	    seed: int,
-	    sigma: float,
+	    sigmas: str,
 	    model,
 	    latent,
 	    positive,
@@ -792,6 +1047,9 @@ class SpectralVAEDetailer:
 	    boost_confidence: float,
 	    color_drift: float,
 	    color_drift_radius: int,
+	    bloom_strength: float,
+	    bloom_threshold: float,
+	    bloom_radius: int,
 	    cfg: float,
 	    cfg_hf_boost: float,
 	    cfg_lf_boost: float,
@@ -803,7 +1061,8 @@ class SpectralVAEDetailer:
 	    detail_strength: float,
 	    hf_radius: int,
 	    mid_strength: float,
-	    chroma_strength: float,
+	    detail_chroma: float,
+	    chromatic_aberration: float,
 	    protect_lows: float,
 	    soft_clip_detail: bool,
 	    soft_clip_detail_k: float,
@@ -811,13 +1070,16 @@ class SpectralVAEDetailer:
 	    soft_clip_cfg_k: float,
 	    noise_scale: float,
 	    noise_radius: int,
+	    noise_tail: float,
 	    noise_flat_suppress: float,
-	    hires_scale: int,
+	    grain_luma: float,
+	    hires_scale: float,
 	    hires_strength: float,
 	    hires_use_importance_mask: bool,
 	    hires_mask_strength: float,
 	    ignore_cond_timestep_range: bool,
-	    debug_print: bool,
+	    debug: bool,
+	    **kwargs,
 	):
 		_ensure_model_loaded(model)
 
@@ -834,59 +1096,99 @@ class SpectralVAEDetailer:
 		if torch.is_floating_point(x_base) and x_base.dtype != model_dtype:
 			x_base = x_base.to(dtype=model_dtype)
 
-		sig = float(max(1e-6, sigma))
+		sigmas_list = _parse_sigmas_string(sigmas)
+		sigma_values = None  # filled after base_model is available
 		used_seed = _resolve_seed(int(seed))
+
+		# Backward-compatible: old 'debug_print' input
+		if bool(kwargs.get("debug_print", False)):
+			debug = True
 
 		# Base resolution latent for post-processing
 		x_in = x_base
 
+		# Cache for expensive detail masks keyed by radius (valid only for this apply() call).
+		detail_mask_cache: dict[int, torch.Tensor] = {}
+
 		# Optional hires pass: UNet at upscaled, downsample denoised back to base
-		scl = int(max(1, min(4, hires_scale)))
+		scl = float(max(1.0, min(4.0, float(hires_scale))))
 		hs = float(max(0.0, min(1.0, hires_strength)))
 		hm = float(max(0.0, min(1.0, hires_mask_strength)))
 
-		# Debug-only tensors (avoid extra refs when not debugging)
-		out_pos = None
-		out_neg = None
+		# Map normalized sigma positions to actual sigma values from the model schedule.
+		# Run all UNet evaluations under a single pre_run/cleanup to avoid per-step overhead.
+		with _patcher_ctx(model):
+			_base_for_sig = _get_base_model(model)
+			sigma_values = [float(_sigma_from_ratio(_base_for_sig, r)) for r in sigmas_list]
 
-		if scl > 1 and hs > 0.0:
-			if debug_print:
-				print(f"[SpectralVAEDetailer] applying hires fix... scale={scl} strength={hs:.2f} mask={bool(hires_use_importance_mask)} mask_strength={hm:.2f}")
+			# Debug-only tensors (avoid extra refs when not debugging)
+			out_pos = None
+			out_neg = None
 
-			x_hi = _upsample_latent(x_base, scl)
+			use_hires = (scl > 1.0 and hs > 0.0)
 
-			with _patcher_ctx(model):
-				base_model, out_pos_hi, out_neg_hi = self._cond_uncond_outs(model, x_hi, sig, positive, negative, bool(ignore_cond_timestep_range))
+			# Prepare hires tensors once
+			if use_hires:
+				if debug:
+					print(f"[LatentDetailer] applying hires fix... scale={scl:.2f} strength={hs:.2f} sigmas={sigmas_list} mask={bool(hires_use_importance_mask)} mask_strength={hm:.2f}")
 
-			den_pos_hi = _calculate_denoised(base_model, x_hi, sig, out_pos_hi)
-			den_neg_hi = _calculate_denoised(base_model, x_hi, sig, out_neg_hi)
+				x_hi = _upsample_latent(x_base, scl)
+				hw = (x_base.shape[-2], x_base.shape[-1])
 
-			hw = (x_base.shape[-2], x_base.shape[-1])
-			den_pos_ds = _downsample_latent_area(den_pos_hi, hw)
-			den_neg_ds = _downsample_latent_area(den_neg_hi, hw)
-
-			# Residual from base
-			res_pos = den_pos_ds - x_base
-			res_neg = den_neg_ds - x_base
-
-			if bool(hires_use_importance_mask) and hm > 0.0:
-				m = _hires_importance_mask(x_base)  # (B,1,H,W)
-				w = hs * ((1.0 - hm) + hm * m)
-				w = w.clamp(0.0, 1.0)
-			else:
 				w = hs
+				if bool(hires_use_importance_mask) and hm > 0.0:
+					m_imp = _hires_importance_mask(x_base)  # (B,1,H,W)
+					w = hs * ((1.0 - hm) + hm * m_imp)
+					w = w.clamp(0.0, 1.0)
 
-			den_pos = x_base + res_pos * w
-			den_neg = x_base + res_neg * w
+			den_pos_acc = None
+			den_neg_acc = None
 
-			if debug_print:
-				out_pos, out_neg = out_pos_hi, out_neg_hi
-				print("[SpectralVAEDetailer] hires fix done.")
-		else:
-			with _patcher_ctx(model):
-				base_model, out_pos, out_neg = self._cond_uncond_outs(model, x_in, sig, positive, negative, bool(ignore_cond_timestep_range))
-			den_pos = _calculate_denoised(base_model, x_in, sig, out_pos)
-			den_neg = _calculate_denoised(base_model, x_in, sig, out_neg)
+			for i, sig in enumerate(sigma_values):
+				sig = float(max(1e-6, sig))
+
+				if use_hires:
+					base_model, out_pos_hi, out_neg_hi = self._cond_uncond_outs(model, x_hi, sig, positive, negative, bool(ignore_cond_timestep_range))
+					den_pos_hi = _calculate_denoised(base_model, x_hi, sig, out_pos_hi)
+					den_neg_hi = _calculate_denoised(base_model, x_hi, sig, out_neg_hi)
+
+					den_pos_ds = _downsample_latent_area(den_pos_hi, hw)
+					den_neg_ds = _downsample_latent_area(den_neg_hi, hw)
+
+					res_pos = den_pos_ds - x_base
+					res_neg = den_neg_ds - x_base
+
+					if torch.is_tensor(w):
+						den_pos_i = x_base + res_pos * w
+						den_neg_i = x_base + res_neg * w
+					else:
+						den_pos_i = x_base + res_pos * float(w)
+						den_neg_i = x_base + res_neg * float(w)
+
+					if debug and i == 0:
+						out_pos, out_neg = out_pos_hi, out_neg_hi
+
+				else:
+					base_model, out_pos_i, out_neg_i = self._cond_uncond_outs(model, x_in, sig, positive, negative, bool(ignore_cond_timestep_range))
+					den_pos_i = _calculate_denoised(base_model, x_in, sig, out_pos_i)
+					den_neg_i = _calculate_denoised(base_model, x_in, sig, out_neg_i)
+
+					if debug and i == 0:
+						out_pos, out_neg = out_pos_i, out_neg_i
+
+				if den_pos_acc is None:
+					den_pos_acc = den_pos_i
+					den_neg_acc = den_neg_i
+				else:
+					den_pos_acc = den_pos_acc + den_pos_i
+					den_neg_acc = den_neg_acc + den_neg_i
+
+			inv_n = 1.0 / float(max(1, len(sigma_values)))
+			den_pos = den_pos_acc * inv_n
+			den_neg = den_neg_acc * inv_n
+
+		if use_hires and debug:
+			print("[LatentDetailer] hires fix done.")
 
 		# Base detail projection
 		base_delta = den_pos - x_in
@@ -907,7 +1209,7 @@ class SpectralVAEDetailer:
 			base_hp = _soft_clip_tanh(base_hp, float(soft_clip_detail_k))
 
 		# Chroma scaling for detail/CFG injections
-		cs = float(chroma_strength)
+		cs = float(detail_chroma)
 		if base_hp.shape[1] >= 4 and cs != 1.0:
 			base_hp[:, 1:4].mul_(cs)
 
@@ -917,7 +1219,7 @@ class SpectralVAEDetailer:
 		lc = float(max(0.0, min(1.0, luma_clarity)))
 		ld = None
 		if lc > 0.0:
-			ld = _luma_clarity_delta(den_pos, x_in, int(hf_radius), lc)
+			ld = _luma_clarity_delta(den_pos, x_in, int(hf_radius), lc, mask_cache=detail_mask_cache)
 			out[:, :1].add_(ld)
 
 		# Boost confidence (channel 0 only)
@@ -948,7 +1250,11 @@ class SpectralVAEDetailer:
 				r_det = int(max(0, cfg_radius))
 
 				mask_r = max(1, int(hf_radius))
-				m = _content_detail_mask_from_latent(x_in, mask_r)
+				if mask_r in detail_mask_cache:
+					m = detail_mask_cache[mask_r]
+				else:
+					m = _content_detail_mask_from_latent(x_in, mask_r)
+					detail_mask_cache[mask_r] = m
 
 				fr = int(max(0, cfg_adapt_feather))
 				if fr > 0:
@@ -991,14 +1297,23 @@ class SpectralVAEDetailer:
 			    radius=int(color_drift_radius),
 			    hf_radius=int(hf_radius),
 			    strength=cds,
+			    mask_cache=detail_mask_cache,
 			)
 			out.add_(cd)
+
+		# Bloom / halation approximation (luma only)
+		bs = float(max(0.0, min(1.0, bloom_strength)))
+		if bs > 0.0:
+			_apply_bloom_luma(out, bs, int(bloom_radius), float(bloom_threshold))
 
 		# Grain (always local_smoothstep; noise_suppress_mode retired)
 		ns = float(max(0.0, noise_scale))
 		if ns > 0.0:
 			n = _randn_like(out, used_seed)
 			g = _bandpass_grain(n, int(noise_radius))
+			nt = float(max(-1.0, min(1.0, noise_tail)))
+			if nt != 0.0:
+				g = _shape_noise_tail(g, nt)
 
 			fs = float(max(0.0, min(1.0, noise_flat_suppress)))
 			if fs > 0.0:
@@ -1022,12 +1337,18 @@ class SpectralVAEDetailer:
 				grain_map = torch.sigmoid(-float(_GRAIN_EXPOSURE_STRENGTH) * lum)
 				g = g * grain_map
 
+			# Luma-dependent grain (shadows > highlights)
+			gl = float(max(0.0, min(1.0, grain_luma)))
+			if gl > 0.0:
+				w_luma = _grain_luma_weight(den_pos, gl, int(noise_radius))
+				g = g * w_luma
+
 			if g.shape[1] >= 4 and _GRAIN_CHROMA_MODE_SEPARATE:
 				g[:, 1:4].mul_(float(_GRAIN_CHROMA_STRENGTH))
 
 			out.add_(g, alpha=ns)
 
-		if debug_print:
+		if debug:
 			# out_pos/out_neg are only meaningful for debug stats; if hires was used and debug_print False,
 			# they were intentionally not retained.
 			d_unet = float((out_pos - out_neg).abs().mean().item()) if (out_pos is not None and out_neg is not None) else 0.0
@@ -1035,10 +1356,15 @@ class SpectralVAEDetailer:
 			d_lc = float(ld.abs().mean().item()) if ld is not None else 0.0
 			d_bc = float(bd.abs().mean().item()) if bd is not None else 0.0
 			d_cd = float(cd.abs().mean().item()) if cd is not None else 0.0
-			print(f"[SpectralVAEDetailer] hires_scale={scl} hires_strength={hs:.2f} mask={bool(hires_use_importance_mask)} mask_strength={hm:.2f} "
-			      f"| cfg={c:.3f} sigma={sig:.4f} lc={lc:.3f} bc={bc:.3f} drift={cds:.3f} noise={ns:.3f} "
+			print(f"[LatentDetailer] hires_scale={scl} hires_strength={hs:.2f} mask={bool(hires_use_importance_mask)} mask_strength={hm:.2f} "
+			      f"| cfg={c:.3f} sigmas={','.join(f'{v:.4f}' for v in sigma_values)} lc={lc:.3f} bc={bc:.3f} drift={cds:.3f} noise={ns:.3f} "
 			      f"| mean|pos-neg|={d_unet:.6g} mean|den_pos-den_neg|={d_den:.6g} "
 			      f"mean|lc_delta|={d_lc:.6g} mean|bc_delta|={d_bc:.6g} mean|drift_delta|={d_cd:.6g}")
+
+		# Chromatic aberration (spatial misregistration of chroma channels 1..3)
+		ca = float(max(0.0, min(1.0, chromatic_aberration)))
+		if ca > 0.0 and out.shape[1] >= 4:
+			out = self._apply_chromatic_aberration(out, ca)
 
 		# Back to original device/dtype
 		out = out.to(device=orig_dev)
@@ -1050,10 +1376,16 @@ class SpectralVAEDetailer:
 		return (out_latent, )
 
 
+class LatentDetailer(SpectralVAEDetailer):
+	pass
+
+
 NODE_CLASS_MAPPINGS = {
-    "SpectralVAEDetailer": SpectralVAEDetailer,
+    "LatentDetailer": LatentDetailer,
+    "SpectralVAEDetailer": LatentDetailer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SpectralVAEDetailer": "SpectralVAEDetailer",
+    "LatentDetailer": "LatentDetailer",
+    "SpectralVAEDetailer": "SpectralVAEDetailer (alias)",
 }

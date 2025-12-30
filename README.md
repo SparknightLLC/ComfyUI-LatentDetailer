@@ -1,105 +1,71 @@
-# ComfyUI-SpectralVAEDetailer
+# ComfyUI-LatentDetailer
 
 <p align="center">
 <img src="https://github.com/user-attachments/assets/2ece32c1-fa64-46ec-9921-8181b200d6dd" width=500>
 </p>
 
+ *(Formerly ComfyUI-SpectralVAEDetailer)*
+
 A node for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) that adjusts a latent image before the VAE decoding step in order to improve your image quality.
 
-By default, the Spectral Detailer will:
+It performs a fast latent-space “detail pass”: runs one (or more) extra UNet evaluation(s) at configurable sigma positions, then reinjects controlled high-frequency structure + optional CFG delta, with lightweight post-ops (micrograin, bloom/halation, color drift, chroma controls).
 
-- Tame harsh, unnatural highlights and shadows.
-- Inject micro-grain (band-pass, VAE-friendly noise) that reads as photographic texture instead of “AI smoothness”, while avoiding big shifts in overall lighting.
-- Improve perceived micro-detail by projecting a single, low-cost UNet “denoised” estimate back into the latent and selectively reinjecting high-frequency structure.
-- Provide an optional, dedicated CFG-delta injection path so CFG can influence the final latent adjustment in a controlled way.
+Also published on the **Comfy Registry** (search for “LatentDetailer”).
 
-View [related thread on Reddit](https://reddit.com/r/StableDiffusion/comments/1pucj4g/spectral_vae_detailer_new_way_to_squeeze_out_more/) for demo images.
-
-It was specifically designed to boost photorealism in SDXL. Demo images generated with [Snakebite 2.4 Turbo](https://civitai.com/models/2068592/snakebite-2). If you're using a different checkpoint or VAE, you may need to tweak the parameters for best results.
-
+View the [related thread on Reddit](https://reddit.com/r/StableDiffusion/comments/1pucj4g/spectral_vae_detailer_new_way_to_squeeze_out_more/) for demo images.
 
 > [!TIP]
-> If the effect is too strong, please check `example_workflows` for recommended presets!
+> If the effect is too strong, please check the `example_workflows` folder for recommended presets!
 
----
+## What it does (high level)
 
-## How it works (high level)
+1. Computes a denoised estimate from the current latent using UNet at one or more sigma positions (`sigmas`).
+2. Extracts / boosts high-frequency structure and reinjects it into the latent (with optional “protect lows” logic).
+3. Optionally injects a guidance-delta term (CFG delta) to ensure guidance has a visible impact in this stage.
+4. Optional finishing:
+   - micrograin injection
+   - bloom / halation approximation (luma-only)
+   - color drift
+   - chromatic aberration (spatial chroma misregistration)
 
-SpectralVAEDetailer performs **one extra UNet evaluation** at a chosen `sigma`, then:
+## Key inputs
 
-1. Computes a denoised latent estimate.
-2. Splits that delta into low-frequency vs high-frequency components using a fast blur (`avg_pool2d`).
-3. Reinforces the high-frequency component with safety gating (`protect_lows`) to avoid wrecking smooth gradients.
-4. Optionally adds a **separate CFG-delta injection** (high/low split) so guidance has an observable effect without overpowering the detail pass.
-5. Adds **band-pass correlated micrograin** (`noise_radius`) that is stable and VAE-friendly (and can be suppressed in flat regions).
+### `sigmas` (STRING)
+Comma-delimited list of normalized sigma positions in **[0..1]**.  
+Each entry triggers one UNet eval; results are averaged.
 
-Everything happens in latent space, before VAE decode.
+- `0.0` = early/noisy (largest sigma)
+- `1.0` = late/clean (smallest sigma)
 
-## Installation
+Examples:
+- `0.40` (default)
+- `0.25,0.55`
 
-1. Go to your ComfyUI `custom_nodes` directory:
-   - `ComfyUI/custom_nodes/`
+### Hi-res fix
+- `hires_scale` (FLOAT, 1.0–4.0): fractional allowed (e.g. 1.5)
+- `hires_strength`: how much of the hi-res residual is applied back at 1x
+- `hires_use_importance_mask` + `hires_mask_strength`: focuses work where the base latent has more structure
 
-2. Clone this repository:
-   - `git clone https://github.com/YOURNAME/ComfyUI-SpectralVAEDetailer.git`
+### Detail / structure
+- `detail_strength`, `hf_radius`, `protect_lows`: primary detail reinjection controls
+- `mid_strength`: optional mid-frequency shaping
 
-3. Restart ComfyUI.
+### Chroma controls
+- `detail_chroma`: scales how strongly detail + CFG injections affect **chroma latent channels** (1..3).
+- `chromatic_aberration`: lens-like spatial misregistration applied to chroma channels (1..3) **after** all other adjustments. Keep subtle (typically ~0.02–0.10).
 
-Find the node in:
+### Bloom / halation
+- `bloom_strength`: spreads bright luma highlights (channel 0) into a soft glow
+- `bloom_threshold`: highlight threshold
+- `bloom_radius`: blur radius (bigger = softer, slower)
 
-**Add Node → latent → postprocess → SpectralVAEDetailer**
+### Grain
+- `noise_scale`, `noise_radius`, `noise_flat_suppress`: micrograin injection controls
+- `grain_luma`: modulates grain by luma (more in shadows, less in highlights)
 
-> [!TIP]
-> This node is also available on the Comfy Registry, so you can install it through Comfy Manager.
-
-## Usage
-
-Place **SpectralVAEDetailer** after your sampler (when you already have a `LATENT`) and before **VAE Decode**.
-
-Typical chain:
-
-`KSampler → SpectralVAEDetailer → VAE Decode → Preview Image`
-
-## Key parameters
-
-### `sigma`
-
-The noise level used for the single UNet evaluation. Lower values tend to be subtler; higher values may cause the image to look "splotchy" - especially in plain areas, such as solid color backgrounds.
-
-### `detail_strength`, `hf_radius`, `protect_lows`
-
-Control how much high-frequency structure is reinjected and how strongly smooth gradients are protected.
-
-### `cfg`, `cfg_hf_boost`, `cfg_radius`
-
-Optional guidance-delta injection. If you want CFG to “show up” in the detailer stage, increase `cfg_hf_boost`.
-
-### `noise_scale`, `noise_radius`, `noise_flat_suppress`
-
-Latent micrograin injection:
-
-- `noise_radius`: controls grain size / cluster scale (band-pass).
-- `noise_flat_suppress`: suppress grain in flat areas (`0` = grain everywhere).
-
-## Tips
-
-- If your image looks too flat:
-  - reduce `hf_radius`.
-
-- If your image looks too "splotchy"/noisy:
-  - reduce `sigmas` (try 0.2 or 0.3)
-  - or just upscale your image to smooth things out
-
-- If you want to control brightness:
-  - increase `mid_strength` for brighter, lower it for darker
-
-- If your images look blurry:
-  - reduce `radius` and `chroma` parameters.
 
 ## Notes
 
-This node is *speed-oriented* by design: it uses one extra UNet pass plus lightweight tensor ops.
+This node is intentionally speed-oriented: by default, it adds **only one** extra UNet passes plus lightweight tensor ops.
 
-For typical SDXL resolution (1024px), the node takes around 0.2-0.4s to complete on a Geforce 3090.
-
-It's primarily tuned for SDXL photorealism workflows, but can be experimented with on other latent diffusion models. You can try using it as a general-purpose color grading tool.
+It’s primarily tuned for SDXL photoreal workflows, but can be experimented with on other latent diffusion models.
