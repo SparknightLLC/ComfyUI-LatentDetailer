@@ -4,9 +4,7 @@
 <img src="https://github.com/user-attachments/assets/2ece32c1-fa64-46ec-9921-8181b200d6dd" width=500>
 </p>
 
- *(Formerly ComfyUI-SpectralVAEDetailer)*
-
-A node for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) that adjusts a latent image before the VAE decoding step in order to improve your image quality.
+A node for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) that adjusts a latent image before the VAE decoding step in order to improve your image quality. *(Formerly ComfyUI-SpectralVAEDetailer)*
 
 It performs a fast latent-space “detail pass”: runs one (or more) extra UNet evaluation(s) at configurable sigma positions, then reinjects controlled high-frequency structure + optional CFG delta, with lightweight post-ops (micrograin, bloom/halation, color drift, chroma controls).
 
